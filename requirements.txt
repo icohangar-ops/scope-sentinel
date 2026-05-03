@@ -1,0 +1,10 @@
+# Scope.Sentinel — REIT Analytics Platform on AWS
+# Core dependencies
+boto3>=1.34.0
+botocore>=1.34.0
+requests>=2.31.0
+python-dotenv>=1.0.0
+pyarrow>=14.0.0
+pandas>=2.1.0
+beautifulsoup4>=4.12.0
+lxml>=5.0.0
