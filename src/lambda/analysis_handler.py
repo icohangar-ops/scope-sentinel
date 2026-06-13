@@ -17,6 +17,44 @@ import boto3
 
 logger = logging.getLogger(__name__)
 
+# Allowlist of tradeable REIT tickers. Any ticker interpolated into Athena SQL
+# MUST be validated against this set to prevent SQL injection via the Lambda
+# event payload. Kept in sync with sec_ingestion_handler.REIT_TICKERS.
+ALLOWED_TICKERS = frozenset(
+    ["O", "AMT", "PLD", "SPG", "EQIX", "PSB", "AVB", "WELL", "DLR", "VICI", "CCI", "AMH"]
+)
+
+
+def _validate_ticker(ticker) -> str:
+    """Validate a ticker against the allowlist before SQL interpolation.
+
+    Raises ValueError for any value not in ALLOWED_TICKERS. This is the only
+    sanctioned way ticker values may reach an Athena query string.
+    """
+    if not isinstance(ticker, str) or ticker not in ALLOWED_TICKERS:
+        raise ValueError(f"Disallowed or invalid ticker: {ticker!r}")
+    return ticker
+
+
+def _sql_str(value, max_len: int = 4000) -> str:
+    """Escape an arbitrary value for safe insertion as a single-quoted SQL literal."""
+    text = str(value)[:max_len]
+    return text.replace("'", "''")
+
+
+def _sql_num(value, default):
+    """Coerce a value to a numeric SQL literal, falling back to default.
+
+    Prevents injection through fields that are interpolated without quotes.
+    """
+    try:
+        num = float(value)
+    except (TypeError, ValueError):
+        num = float(default)
+    if num != num or num in (float("inf"), float("-inf")):  # NaN/inf guard
+        num = float(default)
+    return repr(num)
+
 
 def compute_signal_scores(event):
     """Compute composite Sentinel scores for given tickers.
@@ -35,6 +73,7 @@ def compute_signal_scores(event):
     signals = []
     for ticker in tickers:
         try:
+            ticker = _validate_ticker(ticker)
             # Query for latest financial data
             query = f"""
             SELECT
@@ -106,24 +145,24 @@ def write_signals_to_iceberg(signals: list):
         if signal.get("status") != "computed":
             continue
         try:
-            ticker = signal["ticker"]
+            ticker = _validate_ticker(signal["ticker"])
             query = f"""
             INSERT INTO {database}.reit_signals
             VALUES (
                 '{ticker}_{datetime.utcnow().strftime("%Y%m%d_%H%M%S")}',
                 '{ticker}',
                 TIMESTAMP '{datetime.utcnow().isoformat()}',
-                {signal.get('sentinel_score', 50)},
-                {signal.get('fundamental_score', 50)},
-                {signal.get('valuation_score', 50)},
-                {signal.get('momentum_score', 50)},
-                {signal.get('macro_score', 50)},
-                {signal.get('sentiment_score', 50)},
-                '{signal.get("signal_rating", "Hold")}',
-                '{signal.get("ai_analysis", "")[:4000].replace("'", "''")}',
-                '{json.dumps(signal.get("key_risks", [])).replace("'", "''")}',
-                '{json.dumps(signal.get("key_opportunities", [])).replace("'", "''")}',
-                {signal.get("confidence_score", 0.5)}
+                {_sql_num(signal.get('sentinel_score'), 50)},
+                {_sql_num(signal.get('fundamental_score'), 50)},
+                {_sql_num(signal.get('valuation_score'), 50)},
+                {_sql_num(signal.get('momentum_score'), 50)},
+                {_sql_num(signal.get('macro_score'), 50)},
+                {_sql_num(signal.get('sentiment_score'), 50)},
+                '{_sql_str(signal.get("signal_rating", "Hold"))}',
+                '{_sql_str(signal.get("ai_analysis", ""))}',
+                '{_sql_str(json.dumps(signal.get("key_risks", [])))}',
+                '{_sql_str(json.dumps(signal.get("key_opportunities", [])))}',
+                {_sql_num(signal.get("confidence_score"), 0.5)}
             )
             """
             athena.start_query_execution(
