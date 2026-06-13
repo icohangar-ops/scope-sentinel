@@ -16,6 +16,8 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import requests
 
+from cubiczan_resilience import resilient
+
 from src.models.sec_filing import FilingStatus, FilingType, SECFiling
 
 logger = logging.getLogger(__name__)
@@ -68,15 +70,24 @@ class EdgarService:
             time.sleep(self.rate_limit - elapsed)
         self._last_request_time = time.time()
 
+    @resilient(timeout=30, max_attempts=3)
+    def _request(self, url: str, params: Optional[Dict]) -> Dict:
+        """Issue the throttled HTTP request to EDGAR with retry/backoff/jitter.
+
+        Raises on transport/HTTP errors so @resilient can retry transient
+        failures; the public _get wrapper converts a final failure to None.
+        """
+        self._throttle()
+        response = self._session.get(url, params=params, timeout=30)
+        response.raise_for_status()
+        if "application/json" in response.headers.get("Content-Type", ""):
+            return response.json()
+        return {"content": response.text, "status_code": response.status_code}
+
     def _get(self, url: str, params: Optional[Dict] = None) -> Optional[Dict]:
         """Make a throttled GET request to EDGAR."""
-        self._throttle()
         try:
-            response = self._session.get(url, params=params, timeout=30)
-            response.raise_for_status()
-            if "application/json" in response.headers.get("Content-Type", ""):
-                return response.json()
-            return {"content": response.text, "status_code": response.status_code}
+            return self._request(url, params)
         except requests.RequestException as e:
             logger.error(f"EDGAR request failed for {url}: {e}")
             return None

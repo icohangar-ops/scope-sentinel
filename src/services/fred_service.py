@@ -13,6 +13,8 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import requests
 
+from cubiczan_resilience import resilient
+
 from src.models.market_indicator import FREDIndicator, MarketIndicator
 
 logger = logging.getLogger(__name__)
@@ -27,15 +29,24 @@ class FREDService:
         self.api_key = api_key or os.environ.get("FRED_API_KEY", "")
         self._session = requests.Session()
 
+    @resilient(timeout=30, max_attempts=3)
+    def _request(self, endpoint: str, params: Dict) -> Dict:
+        """Issue the HTTP request to FRED with retry/backoff/jitter.
+
+        Raises on transport/HTTP errors so @resilient can retry transient
+        failures; the public _get wrapper converts a final failure to None.
+        """
+        response = self._session.get(f"{FRED_BASE_URL}{endpoint}", params=params, timeout=30)
+        response.raise_for_status()
+        return response.json()
+
     def _get(self, endpoint: str, params: Optional[Dict] = None) -> Optional[Dict]:
         """Make a request to FRED API."""
         params = params or {}
         params["api_key"] = self.api_key
         params["file_type"] = "json"
         try:
-            response = self._session.get(f"{FRED_BASE_URL}{endpoint}", params=params, timeout=30)
-            response.raise_for_status()
-            return response.json()
+            return self._request(endpoint, params)
         except requests.RequestException as e:
             logger.error(f"FRED request failed: {e}")
             return None

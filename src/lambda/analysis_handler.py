@@ -8,14 +8,28 @@ Orchestrated by Step Functions state machine:
 4. Generate final signals and write to Iceberg
 """
 
+import hashlib
 import json
 import logging
 import os
+import time
 from datetime import datetime
 
 import boto3
 
+from cubiczan_resilience import FileIdempotencyStore
+
 logger = logging.getLogger(__name__)
+
+# Idempotency store for signal writes. Backed by a file under /tmp (the only
+# writable, warm-reusable path in a Lambda container) so repeated invocations
+# within a warm container short-circuit duplicate INSERTs even before Athena
+# is consulted. The deterministic signal_id is the idempotency key.
+_IDEMPOTENCY_PATH = os.environ.get("SIGNAL_IDEMPOTENCY_PATH", "/tmp/scope-sentinel-signals.json")
+_signal_idempotency = FileIdempotencyStore(_IDEMPOTENCY_PATH)
+
+# Terminal Athena query states.
+_ATHENA_TERMINAL = ("SUCCEEDED", "FAILED", "CANCELLED")
 
 # Allowlist of tradeable REIT tickers. Any ticker interpolated into Athena SQL
 # MUST be validated against this set to prevent SQL injection via the Lambda
@@ -135,8 +149,45 @@ Provide concise investment recommendation (2-3 paragraphs)."""
         return f"Analysis unavailable: {str(e)}"
 
 
+def _deterministic_signal_id(ticker: str, signal: dict) -> str:
+    """Build a deterministic signal_id from ticker + fiscal period.
+
+    The id is a function of the *data the signal describes* (ticker + fiscal
+    year/quarter), NOT wall-clock time, so re-running the pipeline for the same
+    fiscal period produces the same id. This is what makes the downstream
+    INSERT idempotent: a replay collides with the prior row instead of
+    appending a new timestamped duplicate.
+    """
+    fiscal_year = signal.get("fiscal_year", "")
+    quarter = signal.get("quarter", "")
+    digest = hashlib.sha256(
+        f"{ticker}|{fiscal_year}|{quarter}".encode("utf-8")
+    ).hexdigest()[:16]
+    return f"{ticker}_{digest}"
+
+
+def _wait_for_query(athena, query_execution_id: str, timeout_s: float = 60.0) -> str:
+    """Poll GetQueryExecution until the query reaches a terminal state.
+
+    Returns the terminal state string (SUCCEEDED/FAILED/CANCELLED). Without
+    this poll the writer fires-and-forgets, so a FAILED insert would be
+    silently lost and a replay could not tell whether the row landed.
+    """
+    deadline = time.time() + timeout_s
+    delay = 0.5
+    while True:
+        resp = athena.get_query_execution(QueryExecutionId=query_execution_id)
+        state = resp["QueryExecution"]["Status"]["State"]
+        if state in _ATHENA_TERMINAL:
+            return state
+        if time.time() >= deadline:
+            return state
+        time.sleep(delay)
+        delay = min(delay * 2, 5.0)
+
+
 def write_signals_to_iceberg(signals: list):
-    """Write computed signals to Iceberg table via Athena."""
+    """Write computed signals to Iceberg table via Athena (idempotent)."""
     athena = boto3.client("athena")
     database = os.environ.get("GLUE_DATABASE", "scope_sentinel")
     s3_output = os.environ.get("ATHENA_OUTPUT", "s3://scope-sentinel-queries/")
@@ -146,10 +197,21 @@ def write_signals_to_iceberg(signals: list):
             continue
         try:
             ticker = _validate_ticker(signal["ticker"])
+            signal_id = _deterministic_signal_id(ticker, signal)
+
+            # Warm-container short-circuit: if this exact signal_id was already
+            # written in this container, skip re-issuing the INSERT entirely.
+            if _signal_idempotency.already_done(signal_id):
+                logger.info(f"Signal {signal_id} already written; skipping")
+                continue
+
+            # INSERT guarded by NOT EXISTS so a replay (e.g. Step Functions
+            # retry, or a new container with no local idempotency state) does
+            # not create a duplicate row for the same deterministic signal_id.
             query = f"""
             INSERT INTO {database}.reit_signals
-            VALUES (
-                '{ticker}_{datetime.utcnow().strftime("%Y%m%d_%H%M%S")}',
+            SELECT
+                '{signal_id}',
                 '{ticker}',
                 TIMESTAMP '{datetime.utcnow().isoformat()}',
                 {_sql_num(signal.get('sentinel_score'), 50)},
@@ -163,13 +225,24 @@ def write_signals_to_iceberg(signals: list):
                 '{_sql_str(json.dumps(signal.get("key_risks", [])))}',
                 '{_sql_str(json.dumps(signal.get("key_opportunities", [])))}',
                 {_sql_num(signal.get("confidence_score"), 0.5)}
+            WHERE NOT EXISTS (
+                SELECT 1 FROM {database}.reit_signals WHERE signal_id = '{signal_id}'
             )
             """
-            athena.start_query_execution(
+            response = athena.start_query_execution(
                 QueryString=query,
                 QueryExecutionContext={"Database": database},
                 ResultConfiguration={"OutputLocation": f"{s3_output}signals/write/"},
             )
+
+            # Poll to a terminal state instead of fire-and-forget.
+            state = _wait_for_query(athena, response["QueryExecutionId"])
+            if state == "SUCCEEDED":
+                _signal_idempotency.mark_done(signal_id, response["QueryExecutionId"])
+            else:
+                logger.error(
+                    f"Signal write for {signal_id} ended in state {state}; not marking done"
+                )
         except Exception as e:
             logger.error(f"Error writing signal for {signal.get('ticker')}: {e}")
 

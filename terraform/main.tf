@@ -249,6 +249,34 @@ resource "aws_iam_role_policy" "lambda" {
 }
 
 # ============================================================
+# Dead Letter Queue (analysis Lambda)
+# ============================================================
+
+# Async invocations of the analysis function (EventBridge / Step Functions
+# retries) that exhaust retries are captured here instead of being dropped.
+resource "aws_sqs_queue" "analysis_dlq" {
+  name                      = "${var.project_name}-analysis-dlq"
+  message_retention_seconds = 1209600 # 14 days
+}
+
+# Allow the Lambda role to deliver failed async events to the DLQ.
+resource "aws_iam_role_policy" "lambda_dlq" {
+  name = "${var.project_name}-lambda-dlq-policy"
+  role = aws_iam_role.lambda.id
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Effect   = "Allow"
+        Action   = ["sqs:SendMessage"]
+        Resource = aws_sqs_queue.analysis_dlq.arn
+      }
+    ]
+  })
+}
+
+# ============================================================
 # Lambda Functions
 # ============================================================
 
@@ -283,6 +311,10 @@ resource "aws_lambda_function" "analysis" {
   runtime       = "python3.12"
   timeout       = 300
   memory_size   = 1024
+
+  dead_letter_config {
+    target_arn = aws_sqs_queue.analysis_dlq.arn
+  }
 
   environment {
     variables = {

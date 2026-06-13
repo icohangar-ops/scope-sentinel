@@ -8,3 +8,4 @@ pyarrow>=14.0.0
 pandas>=2.1.0
 beautifulsoup4>=4.12.0
 lxml>=5.0.0
+cubiczan-resilience @ git+https://github.com/icohangar-ops/cubiczan-resilience.git#subdirectory=python
