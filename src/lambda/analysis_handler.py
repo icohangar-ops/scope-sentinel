@@ -18,6 +18,12 @@ from datetime import datetime
 import boto3
 
 from cubiczan_resilience import FileIdempotencyStore
+from scope_core import (
+    SafeAthenaClient,
+    error_response,
+    success_response,
+    validate_in_allowlist,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -42,12 +48,11 @@ ALLOWED_TICKERS = frozenset(
 def _validate_ticker(ticker) -> str:
     """Validate a ticker against the allowlist before SQL interpolation.
 
-    Raises ValueError for any value not in ALLOWED_TICKERS. This is the only
-    sanctioned way ticker values may reach an Athena query string.
+    Delegates to scope_core.validate_in_allowlist (the shared SQL-injection
+    defense); ALLOWED_TICKERS is this repo's domain allowlist. Raises
+    IdentifierError (a ValueError subclass) for any value outside the set.
     """
-    if not isinstance(ticker, str) or ticker not in ALLOWED_TICKERS:
-        raise ValueError(f"Disallowed or invalid ticker: {ticker!r}")
-    return ticker
+    return validate_in_allowlist(ticker, ALLOWED_TICKERS, field="ticker")
 
 
 def _sql_str(value, max_len: int = 4000) -> str:
@@ -80,9 +85,13 @@ def compute_signal_scores(event):
     }
     """
     tickers = event.get("tickers", [])
-    athena = boto3.client("athena")
     database = os.environ.get("GLUE_DATABASE", "scope_sentinel")
     s3_output = os.environ.get("ATHENA_OUTPUT", "s3://scope-sentinel-queries/")
+    client = SafeAthenaClient(
+        boto3.client("athena"),
+        database=database,
+        output_location=f"{s3_output}signals/",
+    )
 
     signals = []
     for ticker in tickers:
@@ -104,14 +113,10 @@ def compute_signal_scores(event):
               AND fm.quarter = (SELECT MAX(quarter) FROM {database}.financial_metrics WHERE reit_ticker = '{ticker}' AND fiscal_year = fm.fiscal_year)
             WHERE r.ticker = '{ticker}'
             """
-            response = athena.start_query_execution(
-                QueryString=query,
-                QueryExecutionContext={"Database": database},
-                ResultConfiguration={"OutputLocation": f"{s3_output}signals/"},
-            )
+            query_id = client.start(query)
             signals.append({
                 "ticker": ticker,
-                "query_id": response["QueryExecutionId"],
+                "query_id": query_id,
                 "status": "submitted",
             })
         except Exception as e:
@@ -191,6 +196,11 @@ def write_signals_to_iceberg(signals: list):
     athena = boto3.client("athena")
     database = os.environ.get("GLUE_DATABASE", "scope_sentinel")
     s3_output = os.environ.get("ATHENA_OUTPUT", "s3://scope-sentinel-queries/")
+    client = SafeAthenaClient(
+        athena,
+        database=database,
+        output_location=f"{s3_output}signals/write/",
+    )
 
     for signal in signals:
         if signal.get("status") != "computed":
@@ -229,16 +239,12 @@ def write_signals_to_iceberg(signals: list):
                 SELECT 1 FROM {database}.reit_signals WHERE signal_id = '{signal_id}'
             )
             """
-            response = athena.start_query_execution(
-                QueryString=query,
-                QueryExecutionContext={"Database": database},
-                ResultConfiguration={"OutputLocation": f"{s3_output}signals/write/"},
-            )
+            query_id = client.start(query)
 
             # Poll to a terminal state instead of fire-and-forget.
-            state = _wait_for_query(athena, response["QueryExecutionId"])
+            state = _wait_for_query(athena, query_id)
             if state == "SUCCEEDED":
-                _signal_idempotency.mark_done(signal_id, response["QueryExecutionId"])
+                _signal_idempotency.mark_done(signal_id, query_id)
             else:
                 logger.error(
                     f"Signal write for {signal_id} ended in state {state}; not marking done"
@@ -263,7 +269,7 @@ def handler(event, context):
 
     if step == "compute_scores":
         signals = compute_signal_scores(event)
-        return {"statusCode": 200, "body": json.dumps({"step": step, "signals": signals})}
+        return success_response({"step": step, "signals": signals})
 
     elif step == "bedrock_analysis":
         signals = event.get("signals", [])
@@ -272,10 +278,10 @@ def handler(event, context):
             analysis = invoke_bedrock_analysis(ticker, signal)
             signal["ai_analysis"] = analysis
             signal["status"] = "analyzed"
-        return {"statusCode": 200, "body": json.dumps({"step": step, "signals": signals})}
+        return success_response({"step": step, "signals": signals})
 
     elif step == "write_signals":
         write_signals_to_iceberg(event.get("signals", []))
-        return {"statusCode": 200, "body": json.dumps({"step": step, "status": "completed"})}
+        return success_response({"step": step, "status": "completed"})
 
-    return {"statusCode": 400, "body": json.dumps({"error": f"Unknown step: {step}"})}
+    return error_response(f"Unknown step: {step}", status_code=400)

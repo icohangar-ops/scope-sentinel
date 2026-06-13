@@ -12,6 +12,8 @@ from datetime import datetime
 import boto3
 import requests
 
+from scope_core import success_response, write_object_to_s3
+
 logger = logging.getLogger(__name__)
 
 EDGAR_SEARCH_URL = "https://efts.sec.gov/LATEST/search-index"
@@ -76,11 +78,12 @@ def handler(event, context):
                 if form_type in ("10-K", "10-Q", "8-K"):
                     # Write to S3 for downstream processing
                     s3_key = f"sec_filings/raw/{ticker}/{form_type}/{accession}.json"
-                    s3.put_object(
-                        Bucket=raw_bucket,
-                        Key=s3_key,
-                        Body=json.dumps(filing_data),
-                        ContentType="application/json",
+                    write_object_to_s3(
+                        s3,
+                        bucket=raw_bucket,
+                        key=s3_key,
+                        body=json.dumps(filing_data),
+                        content_type="application/json",
                     )
                     new_filings.append({
                         "ticker": ticker,
@@ -102,4 +105,4 @@ def handler(event, context):
         "timestamp": datetime.utcnow().isoformat(),
     }
 
-    return {"statusCode": 200, "body": json.dumps(result)}
+    return success_response(result)
